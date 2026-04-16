@@ -96,6 +96,36 @@ def vali_imputation(accelerator, model, data_loader):
     model.train()
     return float(np.average(total_loss)) if len(total_loss) > 0 else 0.0
 
+
+def vali_anomaly(accelerator, model, data_loader):
+    model.eval()
+    tp = fp = fn = 0
+    total_loss = []
+    bce = nn.BCEWithLogitsLoss()
+    with torch.no_grad():
+        for batch in data_loader:
+            batch_x, batch_y, batch_x_mark, batch_y_mark = unpack_batch(batch)
+            batch_x = batch_x.float().to(accelerator.device)
+            batch_y = batch_y.float().to(accelerator.device)
+            batch_x_mark = batch_x_mark.float().to(accelerator.device)
+            batch_y_mark = batch_y_mark.float().to(accelerator.device)
+
+            logits = model(batch_x, batch_x_mark, batch_y, batch_y_mark)
+            loss = bce(logits, batch_y)
+            probs = torch.sigmoid(logits)
+            pred = (probs > 0.5).long()
+            true = (batch_y > 0.5).long()
+            pred, true, loss = accelerator.gather_for_metrics((pred, true, loss))
+            total_loss.append(loss.mean().item())
+            tp += int(((pred == 1) & (true == 1)).sum().item())
+            fp += int(((pred == 1) & (true == 0)).sum().item())
+            fn += int(((pred == 0) & (true == 1)).sum().item())
+    model.train()
+    precision = tp / max(tp + fp, 1)
+    recall = tp / max(tp + fn, 1)
+    f1 = (2 * precision * recall) / max(precision + recall, 1e-12)
+    return float(np.average(total_loss)) if total_loss else 0.0, f1
+
 parser = argparse.ArgumentParser(description='Time-LLM')
 
 fix_seed = 2021
@@ -255,6 +285,7 @@ for ii in range(args.itr):
 
     criterion = nn.MSELoss()
     cls_criterion = nn.CrossEntropyLoss()
+    ano_criterion = nn.BCEWithLogitsLoss()
     mae_metric = nn.L1Loss()
 
     train_loader, vali_loader, test_loader, model, model_optim, scheduler = accelerator.prepare(
@@ -302,6 +333,10 @@ for ii in range(args.itr):
                         denom = miss_mask.sum().clamp_min(1.0)
                         loss = sq_err.sum() / denom
                         train_loss.append(loss.item())
+                    elif current_task_name == 'anomaly_detection':
+                        outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                        loss = ano_criterion(outputs, batch_y)
+                        train_loss.append(loss.item())
                     else:
                         if args.output_attention:
                             outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
@@ -325,6 +360,10 @@ for ii in range(args.itr):
                     sq_err = ((outputs - batch_y) ** 2) * miss_mask
                     denom = miss_mask.sum().clamp_min(1.0)
                     loss = sq_err.sum() / denom
+                    train_loss.append(loss.item())
+                elif current_task_name == 'anomaly_detection':
+                    outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                    loss = ano_criterion(outputs, batch_y)
                     train_loss.append(loss.item())
                 else:
                     if args.output_attention:
@@ -386,12 +425,23 @@ for ii in range(args.itr):
                     epoch + 1, train_loss, vali_loss, test_loss
                 )
             )
+        elif args.task_name == 'anomaly_detection':
+            vali_loss, vali_f1 = vali_anomaly(accelerator, model, vali_loader)
+            test_loss, test_f1 = vali_anomaly(accelerator, model, test_loader)
+            vali_mae_loss = 0.0
+            test_mae_loss = 0.0
+            accelerator.print(
+                "Epoch: {0} | Train BCE: {1:.7f} Vali BCE: {2:.7f} Test BCE: {3:.7f} "
+                "Vali F1: {4:.7f} Test F1: {5:.7f}".format(
+                    epoch + 1, train_loss, vali_loss, test_loss, vali_f1, test_f1
+                )
+            )
         else:
             raise NotImplementedError(
                 'Training loss forward path is wired for multitask batches, but validation for task {} '
                 'is not implemented yet.'.format(args.task_name)
             )
-        if args.task_name not in ['classification', 'imputation']:
+        if args.task_name not in ['classification', 'imputation', 'anomaly_detection']:
             accelerator.print(
                 "Epoch: {0} | Train Loss: {1:.7f} Vali Loss: {2:.7f} Test Loss: {3:.7f} MAE Loss: {4:.7f}".format(
                     epoch + 1, train_loss, vali_loss, test_loss, test_mae_loss))

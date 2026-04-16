@@ -161,8 +161,76 @@ class ClassificationTaskDataset(Dataset):
 
 
 class AnomalyTaskDataset(Dataset):
-    def __init__(self, *args, **kwargs):
-        raise NotImplementedError('AnomalyTaskDataset will be added in next incremental change.')
+    """
+    Point-level anomaly dataset for SMD/SMAP/MSL style numpy files.
+    """
+    def __init__(self, args, flag='train'):
+        assert flag in ['train', 'val', 'test']
+        self.args = args
+        self.flag = flag
+        self.seq_len = args.seq_len
+        self.data, self.labels = self._load_arrays()
+        self.num_windows = max(0, len(self.data) - self.seq_len + 1)
+
+    def _load_arrays(self):
+        root = self.args.root_path
+        name = self.args.data
+
+        train_path = os.path.join(root, name, f'{name}_train.npy')
+        test_path = os.path.join(root, name, f'{name}_test.npy')
+        label_path = os.path.join(root, name, f'{name}_test_label.npy')
+
+        if not (os.path.exists(train_path) and os.path.exists(test_path)):
+            raise FileNotFoundError('Missing anomaly npy files under {}/{}'.format(root, name))
+
+        train = np.load(train_path).astype(np.float32)
+        test = np.load(test_path).astype(np.float32)
+        test_labels = np.load(label_path).astype(np.float32) if os.path.exists(label_path) else None
+
+        if train.ndim == 1:
+            train = train[:, None]
+        if test.ndim == 1:
+            test = test[:, None]
+
+        if self.flag == 'train':
+            labels = np.zeros((train.shape[0], 1), dtype=np.float32)
+            return train, labels
+
+        if test_labels is None:
+            labels = np.zeros((test.shape[0], 1), dtype=np.float32)
+        else:
+            if test_labels.ndim == 1:
+                labels = test_labels[:, None]
+            else:
+                labels = test_labels
+            labels = labels.astype(np.float32)
+
+        # split test into val/test halves for quick experimentation
+        mid = len(test) // 2
+        if self.flag == 'val':
+            return test[:mid], labels[:mid]
+        return test[mid:], labels[mid:]
+
+    def __len__(self):
+        return self.num_windows
+
+    def __getitem__(self, index):
+        s = index
+        e = s + self.seq_len
+        x = self.data[s:e]
+        y = self.labels[s:e]
+        x_mark = np.zeros((self.seq_len, 1), dtype=np.float32)
+        y_mark = np.zeros((self.seq_len, 1), dtype=np.float32)
+        return {
+            'task_name': 'anomaly_detection',
+            'x': x.astype(np.float32),
+            'y': y.astype(np.float32),
+            'x_mark': x_mark,
+            'y_mark': y_mark,
+            'label': np.array([-1], dtype=np.int64),
+            'obs_mask': np.ones_like(x, dtype=np.float32),
+            'miss_mask': np.zeros_like(x, dtype=np.float32),
+        }
 
 
 class ImputationTaskDataset(Dataset):

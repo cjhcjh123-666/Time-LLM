@@ -69,6 +69,7 @@ def data_provider_multitask(args, flag):
         drop_last = False
     elif task_name == 'anomaly_detection':
         data_set = AnomalyTaskDataset(args, flag=flag)
+        drop_last = False
     elif task_name == 'imputation':
         base_dataset = _build_forecast_dataset(args, flag).base_dataset
         data_set = ImputationTaskDataset(

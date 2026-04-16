@@ -2,6 +2,7 @@ from math import sqrt
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from transformers import LlamaConfig, LlamaModel, LlamaTokenizer, GPT2Config, GPT2Model, GPT2Tokenizer, BertConfig, \
     BertModel, BertTokenizer
@@ -191,6 +192,8 @@ class Model(nn.Module):
             self.classification_projection = nn.Linear(self.d_ff, self.num_classes)
         elif self.task_name == 'imputation':
             self.imputation_projection = nn.Linear(self.d_ff, 1)
+        elif self.task_name == 'anomaly_detection':
+            self.anomaly_projection = nn.Linear(self.d_ff, 1)
         else:
             raise NotImplementedError
 
@@ -204,6 +207,8 @@ class Model(nn.Module):
             return self.classification(x_enc, x_mark_enc, x_dec, x_mark_dec)
         if self.task_name == 'imputation':
             return self.imputation(x_enc, x_mark_enc, x_dec, x_mark_dec)
+        if self.task_name == 'anomaly_detection':
+            return self.anomaly_detection(x_enc, x_mark_enc, x_dec, x_mark_dec)
         return None
 
     def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
@@ -246,6 +251,21 @@ class Model(nn.Module):
         imputed = self.normalize_layers(imputed, 'denorm')
         return imputed
 
+    def anomaly_detection(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
+        dec_out = self._llm_backbone(
+            x_enc,
+            "detect whether each time point is anomalous in this multivariate time series"
+        )
+        dec_out = torch.reshape(
+            dec_out, (-1, x_enc.shape[-1], dec_out.shape[-2], dec_out.shape[-1]))
+        per_t = dec_out.mean(dim=1)  # [B, L, d_ff]
+        per_t = per_t[:, -self.patch_nums:, :]  # keep patch tokens
+        per_t = per_t.transpose(1, 2)  # [B, d_ff, P]
+        per_t = F.interpolate(per_t, size=self.seq_len, mode='linear', align_corners=False)
+        per_t = per_t.transpose(1, 2)  # [B, seq_len, d_ff]
+        logits = self.anomaly_projection(per_t)  # [B, seq_len, 1]
+        return logits
+
     def _llm_backbone(self, x_enc, task_prompt):
         x_enc = self.normalize_layers(x_enc, 'norm')
 
@@ -281,7 +301,8 @@ class Model(nn.Module):
 
         source_embeddings = self.mapping_layer(self.word_embeddings.permute(1, 0)).permute(1, 0)
         patch_input = x_enc.permute(0, 2, 1).contiguous()
-        enc_out, _ = self.patch_embedding(patch_input.to(torch.bfloat16))
+        patch_dtype = torch.bfloat16 if patch_input.is_cuda else torch.float32
+        enc_out, _ = self.patch_embedding(patch_input.to(patch_dtype))
         enc_out = self.reprogramming_layer(enc_out, source_embeddings, source_embeddings)
         llama_enc_out = torch.cat([prompt_embeddings, enc_out], dim=1)
         dec_out = self.llm_model(inputs_embeds=llama_enc_out).last_hidden_state

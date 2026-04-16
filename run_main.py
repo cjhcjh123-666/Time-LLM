@@ -14,6 +14,7 @@ import time
 import random
 import numpy as np
 import os
+import torch.nn.functional as F
 
 os.environ['CURL_CA_BUNDLE'] = ''
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:64"
@@ -126,6 +127,35 @@ def vali_anomaly(accelerator, model, data_loader):
     f1 = (2 * precision * recall) / max(precision + recall, 1e-12)
     return float(np.average(total_loss)) if total_loss else 0.0, f1
 
+
+def _haar_dwt_step(x):
+    # x: [B, T, C]
+    x = x.permute(0, 2, 1).contiguous()
+    if x.shape[-1] % 2 == 1:
+        x = F.pad(x, (0, 1), mode='replicate')
+    coeff = 1.0 / (2.0 ** 0.5)
+    c = x.shape[1]
+    low_filter = torch.tensor([coeff, coeff], device=x.device, dtype=x.dtype).view(1, 1, 2).repeat(c, 1, 1)
+    high_filter = torch.tensor([coeff, -coeff], device=x.device, dtype=x.dtype).view(1, 1, 2).repeat(c, 1, 1)
+    low = F.conv1d(x, low_filter, stride=2, groups=c)
+    high = F.conv1d(x, high_filter, stride=2, groups=c)
+    return low.permute(0, 2, 1).contiguous(), high.permute(0, 2, 1).contiguous()
+
+
+def wave_consistency_loss(pred, target, levels=2):
+    pred_cur = pred
+    target_cur = target
+    loss = 0.0
+    lv = max(1, int(levels))
+    for _ in range(lv):
+        pred_low, pred_high = _haar_dwt_step(pred_cur)
+        target_low, target_high = _haar_dwt_step(target_cur)
+        loss = loss + F.mse_loss(pred_high, target_high)
+        pred_cur = pred_low
+        target_cur = target_low
+    loss = loss + F.mse_loss(pred_cur, target_cur)
+    return loss / (lv + 1)
+
 parser = argparse.ArgumentParser(description='Time-LLM')
 
 fix_seed = 2021
@@ -186,6 +216,16 @@ parser.add_argument('--stride', type=int, default=8, help='stride')
 parser.add_argument('--prompt_domain', type=int, default=0, help='')
 parser.add_argument('--llm_model', type=str, default='LLAMA', help='LLM model') # LLAMA, GPT2, BERT
 parser.add_argument('--llm_dim', type=int, default='4096', help='LLM model dimension')# LLama7b:4096; GPT2-small:768; BERT-base:768
+parser.add_argument('--llm_model_id', type=str, default='',
+                    help='HF model id or local path, e.g. /path/to/Qwen3-8B')
+parser.add_argument('--llm_local_files_only', action='store_true', default=False,
+                    help='load llm/tokenizer from local files only')
+parser.add_argument('--use_wavelet', action='store_true', default=False,
+                    help='enable wavelet-style multi-scale representation fusion')
+parser.add_argument('--wavelet_level', type=int, default=2,
+                    help='number of recursive wavelet decomposition levels')
+parser.add_argument('--wave_loss_weight', type=float, default=0.0,
+                    help='weight for wave-domain consistency loss (forecast/imputation)')
 
 
 # optimization
@@ -332,6 +372,10 @@ for ii in range(args.itr):
                         sq_err = ((outputs - batch_y) ** 2) * miss_mask
                         denom = miss_mask.sum().clamp_min(1.0)
                         loss = sq_err.sum() / denom
+                        if args.use_wavelet and args.wave_loss_weight > 0:
+                            loss = loss + args.wave_loss_weight * wave_consistency_loss(
+                                outputs, batch_y, levels=args.wavelet_level
+                            )
                         train_loss.append(loss.item())
                     elif current_task_name == 'anomaly_detection':
                         outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
@@ -347,6 +391,10 @@ for ii in range(args.itr):
                         outputs = outputs[:, -args.pred_len:, f_dim:]
                         batch_y = batch_y[:, -args.pred_len:, f_dim:].to(accelerator.device)
                         loss = criterion(outputs, batch_y)
+                        if args.use_wavelet and args.wave_loss_weight > 0:
+                            loss = loss + args.wave_loss_weight * wave_consistency_loss(
+                                outputs, batch_y, levels=args.wavelet_level
+                            )
                         train_loss.append(loss.item())
             else:
                 if current_task_name == 'classification':
@@ -360,6 +408,10 @@ for ii in range(args.itr):
                     sq_err = ((outputs - batch_y) ** 2) * miss_mask
                     denom = miss_mask.sum().clamp_min(1.0)
                     loss = sq_err.sum() / denom
+                    if args.use_wavelet and args.wave_loss_weight > 0:
+                        loss = loss + args.wave_loss_weight * wave_consistency_loss(
+                            outputs, batch_y, levels=args.wavelet_level
+                        )
                     train_loss.append(loss.item())
                 elif current_task_name == 'anomaly_detection':
                     outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
@@ -375,6 +427,10 @@ for ii in range(args.itr):
                     outputs = outputs[:, -args.pred_len:, f_dim:]
                     batch_y = batch_y[:, -args.pred_len:, f_dim:]
                     loss = criterion(outputs, batch_y)
+                    if args.use_wavelet and args.wave_loss_weight > 0:
+                        loss = loss + args.wave_loss_weight * wave_consistency_loss(
+                            outputs, batch_y, levels=args.wavelet_level
+                        )
                     train_loss.append(loss.item())
 
             if (i + 1) % 100 == 0:

@@ -4,9 +4,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from transformers import LlamaConfig, LlamaModel, LlamaTokenizer, GPT2Config, GPT2Model, GPT2Tokenizer, BertConfig, \
+from transformers import AutoConfig, AutoModel, AutoTokenizer, LlamaConfig, LlamaModel, LlamaTokenizer, GPT2Config, GPT2Model, GPT2Tokenizer, BertConfig, \
     BertModel, BertTokenizer
 from layers.Embed import PatchEmbedding
+from layers.WaveletBlock import MultiScaleWaveletBlock
 import transformers
 from layers.StandardNorm import Normalize
 
@@ -41,8 +42,49 @@ class Model(nn.Module):
         self.d_llm = configs.llm_dim
         self.patch_len = configs.patch_len
         self.stride = configs.stride
+        self.use_wavelet = bool(getattr(configs, 'use_wavelet', False))
+        self.wavelet_levels = int(getattr(configs, 'wavelet_level', 2))
+        self.num_wave_bands = self.wavelet_levels + 1
+        self.llm_model_id = getattr(configs, 'llm_model_id', None)
+        self.llm_local_files_only = bool(getattr(configs, 'llm_local_files_only', False))
 
-        if configs.llm_model == 'LLAMA':
+        if self.llm_model_id:
+            self.auto_config = AutoConfig.from_pretrained(
+                self.llm_model_id,
+                trust_remote_code=True,
+                local_files_only=self.llm_local_files_only
+            )
+            self.auto_config.output_attentions = True
+            self.auto_config.output_hidden_states = True
+            if hasattr(self.auto_config, 'num_hidden_layers'):
+                self.auto_config.num_hidden_layers = configs.llm_layers
+            try:
+                self.llm_model = AutoModel.from_pretrained(
+                    self.llm_model_id,
+                    trust_remote_code=True,
+                    local_files_only=self.llm_local_files_only,
+                    config=self.auto_config
+                )
+            except EnvironmentError:
+                self.llm_model = AutoModel.from_pretrained(
+                    self.llm_model_id,
+                    trust_remote_code=True,
+                    local_files_only=False,
+                    config=self.auto_config
+                )
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    self.llm_model_id,
+                    trust_remote_code=True,
+                    local_files_only=self.llm_local_files_only
+                )
+            except EnvironmentError:
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    self.llm_model_id,
+                    trust_remote_code=True,
+                    local_files_only=False
+                )
+        elif configs.llm_model == 'LLAMA':
             # self.llama_config = LlamaConfig.from_pretrained('/mnt/alps/modelhub/pretrained_model/LLaMA/7B_hf/')
             self.llama_config = LlamaConfig.from_pretrained('huggyllama/llama-7b')
             self.llama_config.num_hidden_layers = configs.llm_layers
@@ -174,6 +216,30 @@ class Model(nn.Module):
 
         self.patch_embedding = PatchEmbedding(
             configs.d_model, self.patch_len, self.stride, configs.dropout)
+        self.wavelet_block = MultiScaleWaveletBlock(
+            levels=self.wavelet_levels, dropout=configs.dropout
+        )
+        self.task_to_id = {
+            'long_term_forecast': 0,
+            'short_term_forecast': 0,
+            'forecast': 0,
+            'anomaly_detection': 1,
+            'classification': 2,
+            'imputation': 3,
+        }
+        self.task_embedding = nn.Embedding(4, configs.d_model)
+        self.task_band_logits = nn.Embedding(4, self.num_wave_bands)
+        self.context_band_logits = nn.Sequential(
+            nn.Linear(configs.d_model, configs.d_model),
+            nn.GELU(),
+            nn.Linear(configs.d_model, self.num_wave_bands)
+        )
+        self.wavelet_gate = nn.Sequential(
+            nn.Linear(configs.d_model * 3, configs.d_model),
+            nn.GELU(),
+            nn.Linear(configs.d_model, configs.d_model),
+            nn.Sigmoid()
+        )
 
         self.word_embeddings = self.llm_model.get_input_embeddings().weight
         self.vocab_size = self.word_embeddings.shape[0]
@@ -214,7 +280,8 @@ class Model(nn.Module):
     def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
         dec_out = self._llm_backbone(
             x_enc,
-            "forecast the next {} steps given the previous {} steps information".format(self.pred_len, self.seq_len)
+            "forecast the next {} steps given the previous {} steps information".format(self.pred_len, self.seq_len),
+            "forecast"
         )
 
         dec_out = torch.reshape(
@@ -231,7 +298,8 @@ class Model(nn.Module):
     def classification(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
         dec_out = self._llm_backbone(
             x_enc,
-            "classify the category of this multivariate time series pattern"
+            "classify the category of this multivariate time series pattern",
+            "classification"
         )
         dec_out = torch.reshape(
             dec_out, (-1, x_enc.shape[-1], dec_out.shape[-2], dec_out.shape[-1]))
@@ -242,19 +310,27 @@ class Model(nn.Module):
     def imputation(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
         dec_out = self._llm_backbone(
             x_enc,
-            "impute the missing values in this multivariate time series"
+            "impute the missing values in this multivariate time series",
+            "imputation"
         )
         dec_out = torch.reshape(
             dec_out, (-1, x_enc.shape[-1], dec_out.shape[-2], dec_out.shape[-1]))
-        imputed = self.imputation_projection(dec_out).squeeze(-1)  # [B, N, L]
-        imputed = imputed.permute(0, 2, 1).contiguous()  # [B, L, N]
+        per_t = dec_out.mean(dim=1)  # [B, L, d_ff]
+        per_t = per_t[:, -self.patch_nums:, :]
+        per_t = per_t.transpose(1, 2)  # [B, d_ff, P]
+        per_t = F.interpolate(per_t, size=self.seq_len, mode='linear', align_corners=False)
+        per_t = per_t.transpose(1, 2)  # [B, seq_len, d_ff]
+        imputed = self.imputation_projection(per_t)  # [B, seq_len, 1]
+        if x_enc.shape[-1] > 1:
+            imputed = imputed.repeat(1, 1, x_enc.shape[-1])  # [B, seq_len, N]
         imputed = self.normalize_layers(imputed, 'denorm')
         return imputed
 
     def anomaly_detection(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
         dec_out = self._llm_backbone(
             x_enc,
-            "detect whether each time point is anomalous in this multivariate time series"
+            "detect whether each time point is anomalous in this multivariate time series",
+            "anomaly_detection"
         )
         dec_out = torch.reshape(
             dec_out, (-1, x_enc.shape[-1], dec_out.shape[-2], dec_out.shape[-1]))
@@ -266,7 +342,7 @@ class Model(nn.Module):
         logits = self.anomaly_projection(per_t)  # [B, seq_len, 1]
         return logits
 
-    def _llm_backbone(self, x_enc, task_prompt):
+    def _llm_backbone(self, x_enc, task_prompt, task_name):
         x_enc = self.normalize_layers(x_enc, 'norm')
 
         B, T, N = x_enc.size()
@@ -303,6 +379,24 @@ class Model(nn.Module):
         patch_input = x_enc.permute(0, 2, 1).contiguous()
         patch_dtype = torch.bfloat16 if patch_input.is_cuda else torch.float32
         enc_out, _ = self.patch_embedding(patch_input.to(patch_dtype))
+        if self.use_wavelet:
+            # True Haar-DWT bands + task-conditioned band weights.
+            band_tensor = self.wavelet_block(x_enc)  # [B,T,N,num_bands]
+            b, _, n, _ = band_tensor.shape
+            task_id = self.task_to_id.get(task_name, 0)
+            task_ids = torch.full((b,), task_id, device=x_enc.device, dtype=torch.long)
+            base_logits = self.task_band_logits(task_ids)  # [B,num_bands]
+            enc_group = enc_out.reshape(b, n, enc_out.shape[1], enc_out.shape[2])  # [B,N,P,d]
+            context = enc_group.mean(dim=(1, 2)).float()  # [B,d_model]
+            dynamic_logits = self.context_band_logits(context)  # [B,num_bands]
+            band_weights = torch.softmax(base_logits + dynamic_logits, dim=-1)  # [B,num_bands]
+            wave_fused = torch.einsum("btcn,bn->btc", band_tensor, band_weights)  # [B,T,N]
+            wave_patch_input = wave_fused.permute(0, 2, 1).contiguous()  # [B,N,T]
+            wave_patch, _ = self.patch_embedding(wave_patch_input.to(patch_dtype))
+            task_embed = self.task_embedding(task_ids).repeat_interleave(n, dim=0).unsqueeze(1).expand(-1, enc_out.shape[1], -1)
+            fusion_in = torch.cat([enc_out.float(), wave_patch.float(), task_embed], dim=-1)
+            gate = self.wavelet_gate(fusion_in.float()).to(enc_out.dtype)
+            enc_out = gate * enc_out + (1.0 - gate) * wave_patch
         enc_out = self.reprogramming_layer(enc_out, source_embeddings, source_embeddings)
         llama_enc_out = torch.cat([prompt_embeddings, enc_out], dim=1)
         dec_out = self.llm_model(inputs_embeds=llama_enc_out).last_hidden_state

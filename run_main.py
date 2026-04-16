@@ -98,6 +98,20 @@ parser.add_argument('--use_amp', action='store_true', help='use automatic mixed 
 parser.add_argument('--llm_layers', type=int, default=6)
 parser.add_argument('--percent', type=int, default=100)
 
+# multitask extension (backward compatible; not used by forecast-only loop yet)
+parser.add_argument('--num_classes', type=int, default=2,
+                    help='number of classes for classification tasks')
+parser.add_argument('--mask_rate', type=float, default=0.2,
+                    help='mask ratio for imputation tasks')
+parser.add_argument('--mask_mode', type=str, default='random',
+                    help='mask strategy for imputation, options:[random, block]')
+parser.add_argument('--anomaly_mode', type=str, default='point',
+                    help='anomaly target granularity, options:[point, window]')
+parser.add_argument('--mtl', action='store_true', default=False,
+                    help='enable multi-task training mode')
+parser.add_argument('--task_mix', type=str, default='forecast:1.0,classification:1.0,anomaly_detection:1.0,imputation:1.0',
+                    help='task sampling ratio config for multi-task mode')
+
 args = parser.parse_args()
 ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 deepspeed_plugin = DeepSpeedPlugin(hf_ds_config='./ds_config_zero2.json')

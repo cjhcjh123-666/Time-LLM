@@ -9,6 +9,7 @@ from tqdm import tqdm
 from models import Autoformer, DLinear, TimeLLM
 
 from data_provider.data_factory import data_provider
+from data_provider.data_factory_multitask import data_provider_multitask
 import time
 import random
 import numpy as np
@@ -18,6 +19,15 @@ os.environ['CURL_CA_BUNDLE'] = ''
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:64"
 
 from utils.tools import del_files, EarlyStopping, adjust_learning_rate, vali, load_content
+
+
+def unpack_batch(batch):
+    """
+    Support both legacy tuple batches and new multitask dict batches.
+    """
+    if isinstance(batch, dict):
+        return batch['x'], batch['y'], batch['x_mark'], batch['y_mark']
+    return batch
 
 parser = argparse.ArgumentParser(description='Time-LLM')
 
@@ -137,9 +147,10 @@ for ii in range(args.itr):
         args.embed,
         args.des, ii)
 
-    train_data, train_loader = data_provider(args, 'train')
-    vali_data, vali_loader = data_provider(args, 'val')
-    test_data, test_loader = data_provider(args, 'test')
+    provider = data_provider_multitask if args.mtl else data_provider
+    train_data, train_loader = provider(args, 'train')
+    vali_data, vali_loader = provider(args, 'val')
+    test_data, test_loader = provider(args, 'test')
 
     if args.model == 'Autoformer':
         model = Autoformer.Model(args).float()
@@ -190,9 +201,10 @@ for ii in range(args.itr):
 
         model.train()
         epoch_time = time.time()
-        for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in tqdm(enumerate(train_loader)):
+        for i, batch in tqdm(enumerate(train_loader)):
             iter_count += 1
             model_optim.zero_grad()
+            batch_x, batch_y, batch_x_mark, batch_y_mark = unpack_batch(batch)
 
             batch_x = batch_x.float().to(accelerator.device)
             batch_y = batch_y.float().to(accelerator.device)
@@ -253,8 +265,14 @@ for ii in range(args.itr):
 
         accelerator.print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
         train_loss = np.average(train_loss)
-        vali_loss, vali_mae_loss = vali(args, accelerator, model, vali_data, vali_loader, criterion, mae_metric)
-        test_loss, test_mae_loss = vali(args, accelerator, model, test_data, test_loader, criterion, mae_metric)
+        if args.task_name in ['long_term_forecast', 'short_term_forecast', 'forecast']:
+            vali_loss, vali_mae_loss = vali(args, accelerator, model, vali_data, vali_loader, criterion, mae_metric)
+            test_loss, test_mae_loss = vali(args, accelerator, model, test_data, test_loader, criterion, mae_metric)
+        else:
+            raise NotImplementedError(
+                'Training loss forward path is wired for multitask batches, but validation for task {} '
+                'is not implemented yet.'.format(args.task_name)
+            )
         accelerator.print(
             "Epoch: {0} | Train Loss: {1:.7f} Vali Loss: {2:.7f} Test Loss: {3:.7f} MAE Loss: {4:.7f}".format(
                 epoch + 1, train_loss, vali_loss, test_loss, test_mae_loss))

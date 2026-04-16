@@ -1,3 +1,4 @@
+import os
 import numpy as np
 from torch.utils.data import Dataset
 
@@ -42,8 +43,121 @@ class ForecastTaskDataset(Dataset):
 
 
 class ClassificationTaskDataset(Dataset):
-    def __init__(self, *args, **kwargs):
-        raise NotImplementedError('ClassificationTaskDataset will be added in next incremental change.')
+    """
+    Lightweight .ts classification loader for UCR/UAE style datasets.
+    It supports the common format:
+      <dimension_1_values>:<dimension_2_values>:...:<label>
+    """
+
+    def __init__(self, args, flag='train'):
+        assert flag in ['train', 'val', 'test']
+        self.args = args
+        self.flag = flag
+        self.seq_len = args.seq_len
+        self.samples, self.labels = self._load_split()
+        self.label_to_id = self._build_label_map(self.labels)
+
+    @staticmethod
+    def _build_label_map(labels):
+        unique_labels = sorted(set(labels))
+        return {label: idx for idx, label in enumerate(unique_labels)}
+
+    def _resolve_ts_path(self):
+        suffix_map = {'train': 'TRAIN', 'val': 'TRAIN', 'test': 'TEST'}
+        split_suffix = suffix_map[self.flag]
+
+        # Case 1: user passes a direct .ts path via --data_path
+        if isinstance(self.args.data_path, str) and self.args.data_path.endswith('.ts'):
+            direct_path = os.path.join(self.args.root_path, self.args.data_path)
+            if os.path.exists(direct_path):
+                return direct_path
+
+        # Case 2: <root>/<dataset>/<dataset>_{TRAIN,TEST}.ts
+        candidates = [
+            os.path.join(self.args.root_path, self.args.data, f'{self.args.data}_{split_suffix}.ts'),
+            os.path.join(self.args.root_path, 'UCR', self.args.data, f'{self.args.data}_{split_suffix}.ts'),
+            os.path.join(self.args.root_path, 'UAE', self.args.data, f'{self.args.data}_{split_suffix}.ts'),
+        ]
+        for path in candidates:
+            if os.path.exists(path):
+                return path
+
+        raise FileNotFoundError('Cannot locate classification .ts file for dataset {}'.format(self.args.data))
+
+    @staticmethod
+    def _parse_dimension(dim_text):
+        values = []
+        for token in dim_text.split(','):
+            token = token.strip()
+            if token == '' or token == '?':
+                values.append(np.nan)
+            else:
+                values.append(float(token))
+        return values
+
+    def _load_split(self):
+        file_path = self._resolve_ts_path()
+        samples, labels = [], []
+        in_data = False
+
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if line == '':
+                    continue
+                if line.lower().startswith('@data'):
+                    in_data = True
+                    continue
+                if not in_data or line.startswith('@'):
+                    continue
+
+                parts = line.split(':')
+                if len(parts) < 2:
+                    continue
+
+                label = parts[-1].strip()
+                dims = [self._parse_dimension(part) for part in parts[:-1]]
+                min_len = min(len(dim) for dim in dims)
+                if min_len == 0:
+                    continue
+                dims = [dim[:min_len] for dim in dims]
+                x = np.array(dims, dtype=np.float32).T  # [T, C]
+                samples.append(x)
+                labels.append(label)
+
+        if len(samples) == 0:
+            raise ValueError('No valid samples parsed from {}'.format(file_path))
+        return samples, labels
+
+    def _fit_to_seq_len(self, x):
+        t, c = x.shape
+        if t == self.seq_len:
+            return x
+        if t > self.seq_len:
+            return x[-self.seq_len:, :]
+        out = np.zeros((self.seq_len, c), dtype=np.float32)
+        out[-t:, :] = x
+        return out
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        x = self._fit_to_seq_len(self.samples[index])
+        label = self.label_to_id[self.labels[index]]
+        # classification has no timestamp features; keep a placeholder shape
+        x_mark = np.zeros((self.seq_len, 1), dtype=np.float32)
+        y_mark = np.zeros((self.seq_len, 1), dtype=np.float32)
+        return {
+            'task_name': 'classification',
+            'x': x,
+            'y': x.copy(),
+            'x_mark': x_mark,
+            'y_mark': y_mark,
+            'label': np.array([label], dtype=np.int64),
+            'obs_mask': np.ones_like(x, dtype=np.float32),
+            'miss_mask': np.zeros_like(x, dtype=np.float32),
+        }
 
 
 class AnomalyTaskDataset(Dataset):

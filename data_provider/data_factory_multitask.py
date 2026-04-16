@@ -66,6 +66,7 @@ def data_provider_multitask(args, flag):
             drop_last = False
     elif task_name == 'classification':
         data_set = ClassificationTaskDataset(args, flag=flag)
+        drop_last = False
     elif task_name == 'anomaly_detection':
         data_set = AnomalyTaskDataset(args, flag=flag)
     elif task_name == 'imputation':

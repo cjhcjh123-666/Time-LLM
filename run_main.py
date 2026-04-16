@@ -29,6 +29,42 @@ def unpack_batch(batch):
         return batch['x'], batch['y'], batch['x_mark'], batch['y_mark']
     return batch
 
+
+def get_batch_task_and_label(batch, default_task_name):
+    if isinstance(batch, dict):
+        task_name = batch.get('task_name', default_task_name)
+        if isinstance(task_name, list):
+            task_name = task_name[0]
+        labels = batch.get('label', None)
+        return task_name, labels
+    return default_task_name, None
+
+
+def vali_classification(accelerator, model, data_loader):
+    model.eval()
+    total = 0
+    correct = 0
+    with torch.no_grad():
+        for batch in data_loader:
+            batch_x, batch_y, batch_x_mark, batch_y_mark = unpack_batch(batch)
+            _, labels = get_batch_task_and_label(batch, 'classification')
+            if labels is None:
+                continue
+            labels = labels.squeeze(-1).long().to(accelerator.device)
+            batch_x = batch_x.float().to(accelerator.device)
+            batch_x_mark = batch_x_mark.float().to(accelerator.device)
+            batch_y = batch_y.float().to(accelerator.device)
+            batch_y_mark = batch_y_mark.float().to(accelerator.device)
+            logits = model(batch_x, batch_x_mark, batch_y, batch_y_mark)
+            pred = torch.argmax(logits, dim=-1)
+            pred, labels = accelerator.gather_for_metrics((pred, labels))
+            total += labels.numel()
+            correct += (pred == labels).sum().item()
+    model.train()
+    if total == 0:
+        return 0.0
+    return correct / total
+
 parser = argparse.ArgumentParser(description='Time-LLM')
 
 fix_seed = 2021
@@ -187,6 +223,7 @@ for ii in range(args.itr):
                                             max_lr=args.learning_rate)
 
     criterion = nn.MSELoss()
+    cls_criterion = nn.CrossEntropyLoss()
     mae_metric = nn.L1Loss()
 
     train_loader, vali_loader, test_loader, model, model_optim, scheduler = accelerator.prepare(
@@ -205,6 +242,7 @@ for ii in range(args.itr):
             iter_count += 1
             model_optim.zero_grad()
             batch_x, batch_y, batch_x_mark, batch_y_mark = unpack_batch(batch)
+            current_task_name, labels = get_batch_task_and_label(batch, args.task_name)
 
             batch_x = batch_x.float().to(accelerator.device)
             batch_y = batch_y.float().to(accelerator.device)
@@ -220,6 +258,29 @@ for ii in range(args.itr):
             # encoder - decoder
             if args.use_amp:
                 with torch.cuda.amp.autocast():
+                    if current_task_name == 'classification':
+                        outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                        labels = labels.squeeze(-1).long().to(accelerator.device)
+                        loss = cls_criterion(outputs, labels)
+                        train_loss.append(loss.item())
+                    else:
+                        if args.output_attention:
+                            outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                        else:
+                            outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+
+                        f_dim = -1 if args.features == 'MS' else 0
+                        outputs = outputs[:, -args.pred_len:, f_dim:]
+                        batch_y = batch_y[:, -args.pred_len:, f_dim:].to(accelerator.device)
+                        loss = criterion(outputs, batch_y)
+                        train_loss.append(loss.item())
+            else:
+                if current_task_name == 'classification':
+                    outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                    labels = labels.squeeze(-1).long().to(accelerator.device)
+                    loss = cls_criterion(outputs, labels)
+                    train_loss.append(loss.item())
+                else:
                     if args.output_attention:
                         outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
                     else:
@@ -227,20 +288,9 @@ for ii in range(args.itr):
 
                     f_dim = -1 if args.features == 'MS' else 0
                     outputs = outputs[:, -args.pred_len:, f_dim:]
-                    batch_y = batch_y[:, -args.pred_len:, f_dim:].to(accelerator.device)
+                    batch_y = batch_y[:, -args.pred_len:, f_dim:]
                     loss = criterion(outputs, batch_y)
                     train_loss.append(loss.item())
-            else:
-                if args.output_attention:
-                    outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
-                else:
-                    outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-
-                f_dim = -1 if args.features == 'MS' else 0
-                outputs = outputs[:, -args.pred_len:, f_dim:]
-                batch_y = batch_y[:, -args.pred_len:, f_dim:]
-                loss = criterion(outputs, batch_y)
-                train_loss.append(loss.item())
 
             if (i + 1) % 100 == 0:
                 accelerator.print(
@@ -268,14 +318,27 @@ for ii in range(args.itr):
         if args.task_name in ['long_term_forecast', 'short_term_forecast', 'forecast']:
             vali_loss, vali_mae_loss = vali(args, accelerator, model, vali_data, vali_loader, criterion, mae_metric)
             test_loss, test_mae_loss = vali(args, accelerator, model, test_data, test_loader, criterion, mae_metric)
+        elif args.task_name == 'classification':
+            vali_acc = vali_classification(accelerator, model, vali_loader)
+            test_acc = vali_classification(accelerator, model, test_loader)
+            vali_loss = 1.0 - vali_acc
+            test_loss = 1.0 - test_acc
+            vali_mae_loss = 0.0
+            test_mae_loss = 0.0
+            accelerator.print(
+                "Epoch: {0} | Train CE: {1:.7f} Vali ACC: {2:.7f} Test ACC: {3:.7f}".format(
+                    epoch + 1, train_loss, vali_acc, test_acc
+                )
+            )
         else:
             raise NotImplementedError(
                 'Training loss forward path is wired for multitask batches, but validation for task {} '
                 'is not implemented yet.'.format(args.task_name)
             )
-        accelerator.print(
-            "Epoch: {0} | Train Loss: {1:.7f} Vali Loss: {2:.7f} Test Loss: {3:.7f} MAE Loss: {4:.7f}".format(
-                epoch + 1, train_loss, vali_loss, test_loss, test_mae_loss))
+        if args.task_name != 'classification':
+            accelerator.print(
+                "Epoch: {0} | Train Loss: {1:.7f} Vali Loss: {2:.7f} Test Loss: {3:.7f} MAE Loss: {4:.7f}".format(
+                    epoch + 1, train_loss, vali_loss, test_loss, test_mae_loss))
 
         early_stopping(vali_loss, model, path)
         if early_stopping.early_stop:

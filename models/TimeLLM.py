@@ -33,6 +33,7 @@ class Model(nn.Module):
         super(Model, self).__init__()
         self.task_name = configs.task_name
         self.pred_len = configs.pred_len
+        self.num_classes = getattr(configs, 'num_classes', 2)
         self.seq_len = configs.seq_len
         self.d_ff = configs.d_ff
         self.top_k = 5
@@ -186,6 +187,8 @@ class Model(nn.Module):
         if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
             self.output_projection = FlattenHead(configs.enc_in, self.head_nf, self.pred_len,
                                                  head_dropout=configs.dropout)
+        elif self.task_name == 'classification':
+            self.classification_projection = nn.Linear(self.d_ff, self.num_classes)
         else:
             raise NotImplementedError
 
@@ -195,56 +198,18 @@ class Model(nn.Module):
         if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
             dec_out = self.forecast(x_enc, x_mark_enc, x_dec, x_mark_dec)
             return dec_out[:, -self.pred_len:, :]
+        if self.task_name == 'classification':
+            return self.classification(x_enc, x_mark_enc, x_dec, x_mark_dec)
         return None
 
     def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
-
-        x_enc = self.normalize_layers(x_enc, 'norm')
-
-        B, T, N = x_enc.size()
-        x_enc = x_enc.permute(0, 2, 1).contiguous().reshape(B * N, T, 1)
-
-        min_values = torch.min(x_enc, dim=1)[0]
-        max_values = torch.max(x_enc, dim=1)[0]
-        medians = torch.median(x_enc, dim=1).values
-        lags = self.calcute_lags(x_enc)
-        trends = x_enc.diff(dim=1).sum(dim=1)
-
-        prompt = []
-        for b in range(x_enc.shape[0]):
-            min_values_str = str(min_values[b].tolist()[0])
-            max_values_str = str(max_values[b].tolist()[0])
-            median_values_str = str(medians[b].tolist()[0])
-            lags_values_str = str(lags[b].tolist())
-            prompt_ = (
-                f"<|start_prompt|>Dataset description: {self.description}"
-                f"Task description: forecast the next {str(self.pred_len)} steps given the previous {str(self.seq_len)} steps information; "
-                "Input statistics: "
-                f"min value {min_values_str}, "
-                f"max value {max_values_str}, "
-                f"median value {median_values_str}, "
-                f"the trend of input is {'upward' if trends[b] > 0 else 'downward'}, "
-                f"top 5 lags are : {lags_values_str}<|<end_prompt>|>"
-            )
-
-            prompt.append(prompt_)
-
-        x_enc = x_enc.reshape(B, N, T).permute(0, 2, 1).contiguous()
-
-        prompt = self.tokenizer(prompt, return_tensors="pt", padding=True, truncation=True, max_length=2048).input_ids
-        prompt_embeddings = self.llm_model.get_input_embeddings()(prompt.to(x_enc.device))  # (batch, prompt_token, dim)
-
-        source_embeddings = self.mapping_layer(self.word_embeddings.permute(1, 0)).permute(1, 0)
-
-        x_enc = x_enc.permute(0, 2, 1).contiguous()
-        enc_out, n_vars = self.patch_embedding(x_enc.to(torch.bfloat16))
-        enc_out = self.reprogramming_layer(enc_out, source_embeddings, source_embeddings)
-        llama_enc_out = torch.cat([prompt_embeddings, enc_out], dim=1)
-        dec_out = self.llm_model(inputs_embeds=llama_enc_out).last_hidden_state
-        dec_out = dec_out[:, :, :self.d_ff]
+        dec_out = self._llm_backbone(
+            x_enc,
+            "forecast the next {} steps given the previous {} steps information".format(self.pred_len, self.seq_len)
+        )
 
         dec_out = torch.reshape(
-            dec_out, (-1, n_vars, dec_out.shape[-2], dec_out.shape[-1]))
+            dec_out, (-1, x_enc.shape[-1], dec_out.shape[-2], dec_out.shape[-1]))
         dec_out = dec_out.permute(0, 1, 3, 2).contiguous()
 
         dec_out = self.output_projection(dec_out[:, :, :, -self.patch_nums:])
@@ -252,6 +217,59 @@ class Model(nn.Module):
 
         dec_out = self.normalize_layers(dec_out, 'denorm')
 
+        return dec_out
+
+    def classification(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
+        dec_out = self._llm_backbone(
+            x_enc,
+            "classify the category of this multivariate time series pattern"
+        )
+        dec_out = torch.reshape(
+            dec_out, (-1, x_enc.shape[-1], dec_out.shape[-2], dec_out.shape[-1]))
+        pooled = dec_out.mean(dim=1).mean(dim=1)  # [B, d_ff]
+        logits = self.classification_projection(pooled)
+        return logits
+
+    def _llm_backbone(self, x_enc, task_prompt):
+        x_enc = self.normalize_layers(x_enc, 'norm')
+
+        B, T, N = x_enc.size()
+        x_enc_1d = x_enc.permute(0, 2, 1).contiguous().reshape(B * N, T, 1)
+
+        min_values = torch.min(x_enc_1d, dim=1)[0]
+        max_values = torch.max(x_enc_1d, dim=1)[0]
+        medians = torch.median(x_enc_1d, dim=1).values
+        lags = self.calcute_lags(x_enc_1d)
+        trends = x_enc_1d.diff(dim=1).sum(dim=1)
+
+        prompt = []
+        for b in range(x_enc_1d.shape[0]):
+            min_values_str = str(min_values[b].tolist()[0])
+            max_values_str = str(max_values[b].tolist()[0])
+            median_values_str = str(medians[b].tolist()[0])
+            lags_values_str = str(lags[b].tolist())
+            prompt_ = (
+                f"<|start_prompt|>Dataset description: {self.description}"
+                f"Task description: {task_prompt}; "
+                "Input statistics: "
+                f"min value {min_values_str}, "
+                f"max value {max_values_str}, "
+                f"median value {median_values_str}, "
+                f"the trend of input is {'upward' if trends[b] > 0 else 'downward'}, "
+                f"top 5 lags are : {lags_values_str}<|<end_prompt>|>"
+            )
+            prompt.append(prompt_)
+
+        prompt = self.tokenizer(prompt, return_tensors="pt", padding=True, truncation=True, max_length=2048).input_ids
+        prompt_embeddings = self.llm_model.get_input_embeddings()(prompt.to(x_enc.device))
+
+        source_embeddings = self.mapping_layer(self.word_embeddings.permute(1, 0)).permute(1, 0)
+        patch_input = x_enc.permute(0, 2, 1).contiguous()
+        enc_out, _ = self.patch_embedding(patch_input.to(torch.bfloat16))
+        enc_out = self.reprogramming_layer(enc_out, source_embeddings, source_embeddings)
+        llama_enc_out = torch.cat([prompt_embeddings, enc_out], dim=1)
+        dec_out = self.llm_model(inputs_embeds=llama_enc_out).last_hidden_state
+        dec_out = dec_out[:, :, :self.d_ff]
         return dec_out
 
     def calcute_lags(self, x_enc):

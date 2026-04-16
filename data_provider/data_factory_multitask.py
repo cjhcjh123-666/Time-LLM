@@ -70,7 +70,13 @@ def data_provider_multitask(args, flag):
     elif task_name == 'anomaly_detection':
         data_set = AnomalyTaskDataset(args, flag=flag)
     elif task_name == 'imputation':
-        data_set = ImputationTaskDataset(args, flag=flag)
+        base_dataset = _build_forecast_dataset(args, flag).base_dataset
+        data_set = ImputationTaskDataset(
+            base_dataset=base_dataset,
+            mask_rate=args.mask_rate,
+            mask_mode=args.mask_mode
+        )
+        drop_last = False
     else:
         raise ValueError('Unknown task_name: {}'.format(task_name))
 

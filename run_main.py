@@ -40,6 +40,12 @@ def get_batch_task_and_label(batch, default_task_name):
     return default_task_name, None
 
 
+def get_batch_masks(batch):
+    if isinstance(batch, dict):
+        return batch.get('obs_mask', None), batch.get('miss_mask', None)
+    return None, None
+
+
 def vali_classification(accelerator, model, data_loader):
     model.eval()
     total = 0
@@ -64,6 +70,31 @@ def vali_classification(accelerator, model, data_loader):
     if total == 0:
         return 0.0
     return correct / total
+
+
+def vali_imputation(accelerator, model, data_loader):
+    model.eval()
+    total_loss = []
+    with torch.no_grad():
+        for batch in data_loader:
+            batch_x, batch_y, batch_x_mark, batch_y_mark = unpack_batch(batch)
+            _, miss_mask = get_batch_masks(batch)
+            if miss_mask is None:
+                continue
+            batch_x = batch_x.float().to(accelerator.device)
+            batch_y = batch_y.float().to(accelerator.device)
+            batch_x_mark = batch_x_mark.float().to(accelerator.device)
+            batch_y_mark = batch_y_mark.float().to(accelerator.device)
+            miss_mask = miss_mask.float().to(accelerator.device)
+
+            pred = model(batch_x, batch_x_mark, batch_y, batch_y_mark)
+            sq_err = ((pred - batch_y) ** 2) * miss_mask
+            denom = miss_mask.sum().clamp_min(1.0)
+            loss = sq_err.sum() / denom
+            loss = accelerator.gather_for_metrics(loss)
+            total_loss.append(loss.mean().item())
+    model.train()
+    return float(np.average(total_loss)) if len(total_loss) > 0 else 0.0
 
 parser = argparse.ArgumentParser(description='Time-LLM')
 
@@ -243,6 +274,7 @@ for ii in range(args.itr):
             model_optim.zero_grad()
             batch_x, batch_y, batch_x_mark, batch_y_mark = unpack_batch(batch)
             current_task_name, labels = get_batch_task_and_label(batch, args.task_name)
+            _, miss_mask = get_batch_masks(batch)
 
             batch_x = batch_x.float().to(accelerator.device)
             batch_y = batch_y.float().to(accelerator.device)
@@ -263,6 +295,13 @@ for ii in range(args.itr):
                         labels = labels.squeeze(-1).long().to(accelerator.device)
                         loss = cls_criterion(outputs, labels)
                         train_loss.append(loss.item())
+                    elif current_task_name == 'imputation':
+                        outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                        miss_mask = miss_mask.float().to(accelerator.device)
+                        sq_err = ((outputs - batch_y) ** 2) * miss_mask
+                        denom = miss_mask.sum().clamp_min(1.0)
+                        loss = sq_err.sum() / denom
+                        train_loss.append(loss.item())
                     else:
                         if args.output_attention:
                             outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
@@ -279,6 +318,13 @@ for ii in range(args.itr):
                     outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                     labels = labels.squeeze(-1).long().to(accelerator.device)
                     loss = cls_criterion(outputs, labels)
+                    train_loss.append(loss.item())
+                elif current_task_name == 'imputation':
+                    outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                    miss_mask = miss_mask.float().to(accelerator.device)
+                    sq_err = ((outputs - batch_y) ** 2) * miss_mask
+                    denom = miss_mask.sum().clamp_min(1.0)
+                    loss = sq_err.sum() / denom
                     train_loss.append(loss.item())
                 else:
                     if args.output_attention:
@@ -330,12 +376,22 @@ for ii in range(args.itr):
                     epoch + 1, train_loss, vali_acc, test_acc
                 )
             )
+        elif args.task_name == 'imputation':
+            vali_loss = vali_imputation(accelerator, model, vali_loader)
+            test_loss = vali_imputation(accelerator, model, test_loader)
+            vali_mae_loss = 0.0
+            test_mae_loss = 0.0
+            accelerator.print(
+                "Epoch: {0} | Train Masked-MSE: {1:.7f} Vali Masked-MSE: {2:.7f} Test Masked-MSE: {3:.7f}".format(
+                    epoch + 1, train_loss, vali_loss, test_loss
+                )
+            )
         else:
             raise NotImplementedError(
                 'Training loss forward path is wired for multitask batches, but validation for task {} '
                 'is not implemented yet.'.format(args.task_name)
             )
-        if args.task_name != 'classification':
+        if args.task_name not in ['classification', 'imputation']:
             accelerator.print(
                 "Epoch: {0} | Train Loss: {1:.7f} Vali Loss: {2:.7f} Test Loss: {3:.7f} MAE Loss: {4:.7f}".format(
                     epoch + 1, train_loss, vali_loss, test_loss, test_mae_loss))

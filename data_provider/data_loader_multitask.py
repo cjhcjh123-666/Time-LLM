@@ -166,5 +166,45 @@ class AnomalyTaskDataset(Dataset):
 
 
 class ImputationTaskDataset(Dataset):
-    def __init__(self, *args, **kwargs):
-        raise NotImplementedError('ImputationTaskDataset will be added in next incremental change.')
+    """
+    Build imputation samples by applying synthetic masks on forecasting windows.
+    """
+    def __init__(self, base_dataset, mask_rate=0.2, mask_mode='random'):
+        self.base_dataset = base_dataset
+        self.mask_rate = mask_rate
+        self.mask_mode = mask_mode
+
+    def __len__(self):
+        return len(self.base_dataset)
+
+    def _build_masks(self, x):
+        obs_mask = np.ones_like(x, dtype=np.float32)
+        miss_mask = np.zeros_like(x, dtype=np.float32)
+        t, c = x.shape
+        total = t * c
+        miss_count = max(1, int(total * self.mask_rate))
+
+        if self.mask_mode == 'block':
+            block_len = max(1, int(t * self.mask_rate))
+            start = np.random.randint(0, max(1, t - block_len + 1))
+            miss_mask[start:start + block_len, :] = 1.0
+        else:
+            flat_idx = np.random.choice(total, miss_count, replace=False)
+            miss_mask.reshape(-1)[flat_idx] = 1.0
+        obs_mask = 1.0 - miss_mask
+        return obs_mask, miss_mask
+
+    def __getitem__(self, index):
+        seq_x, seq_y, seq_x_mark, seq_y_mark = self.base_dataset[index]
+        obs_mask, miss_mask = self._build_masks(seq_x)
+        masked_x = seq_x * obs_mask
+        return {
+            'task_name': 'imputation',
+            'x': masked_x.astype(np.float32),
+            'y': seq_x.astype(np.float32),  # reconstruction target
+            'x_mark': seq_x_mark,
+            'y_mark': seq_x_mark,
+            'label': np.array([-1], dtype=np.int64),
+            'obs_mask': obs_mask.astype(np.float32),
+            'miss_mask': miss_mask.astype(np.float32),
+        }

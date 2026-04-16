@@ -189,6 +189,8 @@ class Model(nn.Module):
                                                  head_dropout=configs.dropout)
         elif self.task_name == 'classification':
             self.classification_projection = nn.Linear(self.d_ff, self.num_classes)
+        elif self.task_name == 'imputation':
+            self.imputation_projection = nn.Linear(self.d_ff, 1)
         else:
             raise NotImplementedError
 
@@ -200,6 +202,8 @@ class Model(nn.Module):
             return dec_out[:, -self.pred_len:, :]
         if self.task_name == 'classification':
             return self.classification(x_enc, x_mark_enc, x_dec, x_mark_dec)
+        if self.task_name == 'imputation':
+            return self.imputation(x_enc, x_mark_enc, x_dec, x_mark_dec)
         return None
 
     def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
@@ -229,6 +233,18 @@ class Model(nn.Module):
         pooled = dec_out.mean(dim=1).mean(dim=1)  # [B, d_ff]
         logits = self.classification_projection(pooled)
         return logits
+
+    def imputation(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
+        dec_out = self._llm_backbone(
+            x_enc,
+            "impute the missing values in this multivariate time series"
+        )
+        dec_out = torch.reshape(
+            dec_out, (-1, x_enc.shape[-1], dec_out.shape[-2], dec_out.shape[-1]))
+        imputed = self.imputation_projection(dec_out).squeeze(-1)  # [B, N, L]
+        imputed = imputed.permute(0, 2, 1).contiguous()  # [B, L, N]
+        imputed = self.normalize_layers(imputed, 'denorm')
+        return imputed
 
     def _llm_backbone(self, x_enc, task_prompt):
         x_enc = self.normalize_layers(x_enc, 'norm')
